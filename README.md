@@ -13,6 +13,9 @@ Rust Tokio
 * 🛠️ 支持安装为 Windows 服务（后台运行）
 * Supports installation as Windows Service
 
+* 🛠️ 支持安装为 Linux 服务（systemctl）
+* Supports installation as Linux Service (systemctl)
+
 * 📁 自动识别应用目录的配置和日志文件
 * Auto-detects config/log files in executable directory
 
@@ -40,13 +43,13 @@ Log file path (default: PortForward.log)
 
 ### 子命令 | Subcommands:
 
-* install: 安装为 Windows 服务
+* install: 安装为服务
 
-Install as Windows Service
+Install as Service
 
-* uninstall: 卸载 Windows 服务
+* uninstall: 卸载服务
 
-Uninstall Windows Service
+Uninstall Service
 
 * help: 显示帮助信息
 Show help message
@@ -56,14 +59,14 @@ Show help message
 
 [[forwards]]
 name = "VNC转发"        # 转发规则名称
-local_addr = "172.18.1.3:25001"  # 本地监听地址
-remote_addr = "172.18.1.1:5901"  # 目标远程地址
+local_addr = "127.0.0.1:25001"  # 本地监听地址
+remote_addr = "192.168.1.1:5901"  # 目标远程地址
 
 
 [[forwards]]
 name = "Web服务转发"    # Forwarding rule name
-local_addr = "172.18.1.3:25002"  # Local listen address
-remote_addr = "172.18.1.6:9000"  # Target remote address
+local_addr = "127.0.0.1:25002"  # Local listen address
+remote_addr = "192.168.1.1:9000"  # Target remote address
 
 </code>
 
