@@ -52,36 +52,44 @@ Uninstall Windows Service
 Show help message
 
 ## 配置文件示例 | Config Example (config.toml)
-
 <code>
+
 [[forwards]]
 name = "VNC转发"        # 转发规则名称
 local_addr = "172.18.1.3:25001"  # 本地监听地址
 remote_addr = "172.18.1.1:5901"  # 目标远程地址
 
+
 [[forwards]]
 name = "Web服务转发"    # Forwarding rule name
 local_addr = "172.18.1.3:25002"  # Local listen address
 remote_addr = "172.18.1.6:9000"  # Target remote address
+
 </code>
 
 ## 使用说明 | Instructions
 
 直接运行模式 | Direct Run:
-
 <code>
+
 PortForward -c /path/to/config.toml
+
 </code>
 
 安装服务 | Install Service:
 <code>
+
 PortForward install
+
 </code>
 
 卸载服务 | Uninstall Service:
 <code>
+
 PortForward uninstall
+
 </code>
+
 ## 注意事项 | Notes
 * 配置文件默认位置：程序所在目录的 config.toml
 Default config path: config.toml in executable directory
