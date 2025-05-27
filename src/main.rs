@@ -3,23 +3,24 @@ use tokio::io::copy_bidirectional;
 use tokio::io::AsyncReadExt;
 use tokio::fs::File;
 use tokio::task::JoinSet;
-use tokio::runtime::Runtime;
+
 use tokio::sync::broadcast;
 
 use std::io;
 use std::env;
 use std::path::Path;
-use std::path::PathBuf;
-use std::ffi::OsString;
-use std::time::Duration;
+use std::process::Command;
+
 use serde::Deserialize;
 use clap::Parser;
 use clap::Subcommand;
 
 use tklog::{
-    async_error, async_info,  LEVEL, Format, ASYNC_LOG,LOG,info, error
+    async_error, async_info,  LEVEL, Format, ASYNC_LOG,LOG,info
 };
 
+
+#[cfg(target_os = "windows")]
 use windows_service::{
     service::{
         ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
@@ -29,21 +30,30 @@ use windows_service::{
     service_dispatcher,
     service_manager::{ServiceManager, ServiceManagerAccess},
 };
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::ffi::OsString;
+#[cfg(target_os = "windows")]
+use std::time::Duration;
 
 
-
-
+#[cfg(target_os = "windows")]
 use windows_service::define_windows_service;
 
+
+#[cfg(target_os = "windows")]
 define_windows_service!(ffi_service_main, service_main);
 
 
-const SERVICE_NAME: &str = "PortForwardService";
+const SERVICE_NAME: &str = "PortForward";
+
+
 const SERVICE_DISPLAY_NAME: &str = "Port Forwarding Service";
 
 
 #[derive(Parser, Debug)]
-#[command(version = "1.0")]
+#[command(version = "1.0.1")]
 struct Args {
 
     /// run or service
@@ -95,7 +105,12 @@ async fn main() -> io::Result<()> {
 
     let mut args = Args::parse();
 
-    
+    #[cfg(target_os = "windows")]
+    let default_path = Path::new("D:\\").to_path_buf();
+
+    #[cfg(not(target_os = "windows"))]
+
+    let default_path = Path::new("./").to_path_buf();
    
     let  app_path= match env::current_exe() {
         Ok(exe_path) => {
@@ -103,14 +118,17 @@ async fn main() -> io::Result<()> {
             if let Some(parent) = exe_path.parent() {
                 parent.to_path_buf()
             } else {
-                Path::new("D:\\").to_path_buf()
+
+                default_path
+
             }
             
         },
         Err(e) => 
         {
             async_info!("Failed to get current exe path: ",e.to_string());
-            Path::new("D:\\").to_path_buf()
+
+            default_path
         }
     };
 
@@ -137,13 +155,21 @@ async fn main() -> io::Result<()> {
     match args.command {
         Some(Commands::Install {}) => {
 
+            #[cfg(target_os = "windows")]
+            let _ = install(args.config,args.log);
 
-            let _ = install(Some(args.config.into()),Some(args.log.into()));
+
+            #[cfg(not(target_os = "windows"))]
+            let _ = install_linux(args.config,args.log);
         },
         Some(Commands::Uninstall {}) => {
 
-
+            #[cfg(target_os = "windows")]
             let _ = uninstall();
+
+            #[cfg(not(target_os = "windows"))]
+
+            let _ = uninstall_linux();
         },
         None => {
 
@@ -155,7 +181,7 @@ async fn main() -> io::Result<()> {
                 async_info!("run as service");
 
                 
-                
+                #[cfg(target_os = "windows")]
                 let _ = service_dispatcher::start(SERVICE_NAME, ffi_service_main);
 
 
@@ -164,14 +190,14 @@ async fn main() -> io::Result<()> {
                 
             
                 // command run mode
-           
-
                 println!("Running with config: {}, log: {}", args.config, args.log);
 
 
                 let (stop_sender, _) = broadcast::channel(1);
 
-                start_listen(args.config,stop_sender).await?;
+                if let Err(e) = start_listen(args.config,stop_sender).await{
+                    async_error!(e.to_string());
+                }
 
                 
             }
@@ -269,7 +295,8 @@ async  fn start_listen(config:String,  stop_sender:tokio::sync::broadcast::Sende
 
             let mut set = JoinSet::new();
             for forward in config.forwards {
-                async_info!(forward.name," from ",forward.local_addr," to ",forward.remote_addr);
+
+                async_info!("[",forward.name,"] from ",forward.local_addr," to ",forward.remote_addr);
         
                 let listener: TcpListener = TcpListener::bind(forward.local_addr).await?;
 
@@ -296,7 +323,7 @@ async  fn start_listen(config:String,  stop_sender:tokio::sync::broadcast::Sende
 
 
 // main process for service
-
+#[cfg(target_os = "windows")]
 fn service_main(_:Vec<OsString>) -> windows_service::Result<()> {
 
     let (stop_sender,_) = broadcast::channel(1);
@@ -341,7 +368,8 @@ fn service_main(_:Vec<OsString>) -> windows_service::Result<()> {
     // Tell the system that the service is running now
     status_handle.set_service_status(next_status)?;
 
-
+    use tokio::runtime::Runtime;
+    use tklog::error;
 
     let args = Args::parse();
 
@@ -379,7 +407,8 @@ fn service_main(_:Vec<OsString>) -> windows_service::Result<()> {
 
 
 // install as service
-pub fn install(config_path: Option<PathBuf>, log_path: Option<PathBuf>) -> windows_service::Result<()> {
+#[cfg(target_os = "windows")]
+pub fn install(config_path: String, log_path: String) -> windows_service::Result<()> {
     let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
 
@@ -391,15 +420,15 @@ pub fn install(config_path: Option<PathBuf>, log_path: Option<PathBuf>) -> windo
     
     launch_arguments.push(OsString::from("--daemon"));
     launch_arguments.push(OsString::from("service"));
-    if let Some(config) = &config_path {
-        launch_arguments.push(OsString::from("--config"));
-        launch_arguments.push(OsString::from(config));
-    }
+  
+    launch_arguments.push(OsString::from("--config"));
+    launch_arguments.push(OsString::from(config_path));
     
-    if let Some(log) = &log_path {
-        launch_arguments.push(OsString::from("--log"));
-        launch_arguments.push(OsString::from(log));
-    }
+    
+   
+    launch_arguments.push(OsString::from("--log"));
+    launch_arguments.push(OsString::from(log_path));
+    
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -426,6 +455,7 @@ pub fn install(config_path: Option<PathBuf>, log_path: Option<PathBuf>) -> windo
 
 
 // uninstall from service
+#[cfg(target_os = "windows")]
 pub fn uninstall() -> windows_service::Result<()> {
     let manager_access = ServiceManagerAccess::CONNECT;
     let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
@@ -445,5 +475,87 @@ pub fn uninstall() -> windows_service::Result<()> {
     }
     service.delete()?;
     info!("Service uninstalled successfully");
+    Ok(())
+}
+
+
+#[cfg(not(target_os = "windows"))]
+
+fn install_linux(config_path: String, log_path: String) -> io::Result<()>{
+
+
+    // Get current executable path
+    let service_binary_path = ::std::env::current_exe()
+        .unwrap()
+        .with_file_name("PortForward");
+
+    // Create service file content
+    let service_content = format!(
+        "[Unit]
+Description={}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={} --config {} --log {}
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+",SERVICE_DISPLAY_NAME,service_binary_path.to_str().unwrap(),config_path, log_path
+    );
+
+    // Define service file path
+    let service_file_path = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
+
+    // Write service file
+    use std::io::Write;
+    let mut file = std::fs::File::create(&service_file_path)?;
+    file.write_all(service_content.as_bytes())?;
+
+    // Reload systemd
+    Command::new("systemctl")
+        .args(["daemon-reload"])
+        .status()?;
+
+    // Enable the service
+    Command::new("systemctl")
+        .args(["enable", SERVICE_NAME])
+        .status()?;
+
+    info!("Successfully installed service . You can start it with: systemctl start ", SERVICE_NAME);
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+
+
+fn uninstall_linux() -> io::Result<()> {
+
+    // Stop the service if running
+    let _ = Command::new("systemctl")
+        .args(["stop", SERVICE_NAME])
+        .status()?;
+
+    // Disable the service
+    Command::new("systemctl")
+        .args(["disable", SERVICE_NAME])
+        .status()?;
+
+    // Remove service file
+    let service_file_path = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
+    if Path::new(&service_file_path).exists() {
+        std::fs::remove_file(&service_file_path)?;
+    }
+
+    // Reload systemd
+    Command::new("systemctl")
+        .args(["daemon-reload"])
+        .status()?;
+
+    info!("Successfully uninstalled service ",SERVICE_NAME);
+
     Ok(())
 }
