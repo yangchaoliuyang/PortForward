@@ -22,6 +22,9 @@ Rust Tokio
 * ⚙️ 简洁的 TOML 格式配置文件
 * Clean TOML configuration format
 
+* ⚙️ 双转发支持流量加密
+* multi-forward surport encryption
+  
 * 🔒 当前仅支持 TCP 协议转发
 * TCP protocol only (currently)
 
@@ -61,13 +64,15 @@ Show help message
 name = "VNC转发"        # 转发规则名称
 local_addr = "127.0.0.1:25001"  # 本地监听地址
 remote_addr = "192.168.1.1:5901"  # 目标远程地址
-
+local_encryption = false # 本地监听加密
+remote_encryption = false # 目标远程加密
 
 [[forwards]]
 name = "Web服务转发"    # Forwarding rule name
 local_addr = "127.0.0.1:25002"  # Local listen address
 remote_addr = "192.168.1.1:9000"  # Target remote address
-
+local_encryption = false # 本地监听加密
+remote_encryption = false # 目标远程加密
 </code>
 
 ## 使用说明 | Instructions
