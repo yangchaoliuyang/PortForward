@@ -1,15 +1,17 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::copy_bidirectional;
-use tokio::io::AsyncReadExt;
+use tokio::io::{ AsyncReadExt, AsyncWriteExt};
 use tokio::fs::File;
 use tokio::task::JoinSet;
-
 use tokio::sync::broadcast;
 
+
+
+
 use std::io;
-use std::env;
 use std::path::Path;
-use std::process::Command;
+use std::env;
+
+
 
 use serde::Deserialize;
 use clap::Parser;
@@ -19,37 +21,20 @@ use tklog::{
     async_error, async_info,  LEVEL, Format, ASYNC_LOG,LOG,info
 };
 
+mod encryption;
+use encryption::{SimpleEncryptionContext, encrypt_and_prepend_length};
+
+mod buffer;
+use buffer::PacketBuffer;
+
+mod service;
 
 #[cfg(target_os = "windows")]
-use windows_service::{
-    service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
-        ServiceInfo, ServiceState, ServiceStatus, ServiceStartType, ServiceType,
-    },
-    service_control_handler::{self, ServiceControlHandlerResult},
-    service_dispatcher,
-    service_manager::{ServiceManager, ServiceManagerAccess},
-};
-#[cfg(target_os = "windows")]
-use std::path::PathBuf;
-#[cfg(target_os = "windows")]
-use std::ffi::OsString;
-#[cfg(target_os = "windows")]
-use std::time::Duration;
+use service::{start_service, install, uninstall};
 
 
-#[cfg(target_os = "windows")]
-use windows_service::define_windows_service;
-
-
-#[cfg(target_os = "windows")]
-define_windows_service!(ffi_service_main, service_main);
-
-
-const SERVICE_NAME: &str = "PortForward";
-
-
-const SERVICE_DISPLAY_NAME: &str = "Port Forwarding Service";
+#[cfg(not(target_os = "windows"))]
+use service::{install_linux, uninstall_linux};
 
 
 #[derive(Parser, Debug)]
@@ -86,12 +71,16 @@ enum Commands {
 }
 
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct Forward {
     name:String,
     local_addr: String,
     remote_addr: String,
+    local_encryption: bool,
+    remote_encryption: bool,
 }
+
+
 
 #[derive(Deserialize)]
 struct Config {
@@ -182,7 +171,7 @@ async fn main() -> io::Result<()> {
 
                 
                 #[cfg(target_os = "windows")]
-                let _ = service_dispatcher::start(SERVICE_NAME, ffi_service_main);
+                let _ = start_service();
 
 
             }
@@ -190,12 +179,14 @@ async fn main() -> io::Result<()> {
                 
             
                 // command run mode
-                println!("Running with config: {}, log: {}", args.config, args.log);
+                async_info!("Run as app, Running with config: ", args.config,"log: ", args.log);
 
 
                 let (stop_sender, _) = broadcast::channel(1);
 
-                if let Err(e) = start_listen(args.config,stop_sender).await{
+
+                if let Err(e) = start_listen(stop_sender).await{
+                    
                     async_error!(e.to_string());
                 }
 
@@ -231,37 +222,121 @@ fn log_init(log_path:String) {
 }
 
 
-// sync functions for sockets
-
-async fn handle_client(mut local: TcpStream, remote_addr: String)  -> io::Result<()>{
 
 
-    let mut remote = TcpStream::connect(remote_addr).await?;
 
-    let _ = copy_bidirectional(&mut local,&mut remote).await;
-
+// 使用缓冲区的版本
+async fn handle_client_buffered(
+    forward: Forward,
+    mut local: TcpStream, 
+) -> io::Result<()> {
+    async_info!("[ ",forward.name," ] Connect remote addr:",forward.remote_addr);
+    let mut remote = TcpStream::connect(forward.remote_addr).await?;
     
+    let ctx = if forward.local_encryption || forward.remote_encryption {
+        Some(SimpleEncryptionContext::new())
+    } else {
+        None
+    };
+    
+    let (mut local_reader, mut local_writer) = local.split();
+    let (mut remote_reader, mut remote_writer) = remote.split();
+    
+    let mut local_buffer = PacketBuffer::new();
+    let mut remote_buffer = PacketBuffer::new();
+    
+    // 从本地到远程的流量处理
+    let client_to_server = async {
+        let mut read_buffer: Vec<u8> = vec![0u8; 4096];
+        loop {
+            // 读取数据到缓冲区
+            let n: usize = local_reader.read(&mut read_buffer).await?;
+            
+            if n == 0 {
+                break;
+            }
+            
+            if forward.local_encryption {
 
+                local_buffer.push_data(&read_buffer[..n]);
+
+                
+                // 处理所有完整的数据包
+                while let Some(decrypted_data)= local_buffer.try_read_packet(ctx.as_ref().unwrap())? {
+                    let processed_data: Vec<u8> = if forward.remote_encryption {
+                        encrypt_and_prepend_length(&decrypted_data, ctx.as_ref().unwrap()).await?
+                    } else {
+                        decrypted_data
+                    };
+                    
+                    remote_writer.write_all(&processed_data).await?;
+                }
+            } else {
+                // 非加密模式直接读取，远程需要加密就加密后再发
+                let processed_data: Vec<u8> = if forward.remote_encryption {
+                    encrypt_and_prepend_length(&read_buffer[..n], ctx.as_ref().unwrap()).await?
+                } else {
+                    read_buffer[..n].to_vec()
+                };
+                remote_writer.write_all(&processed_data).await?;
+            }
+        }
+        Ok::<(), io::Error>(())
+    };
+    
+    // 从远程到本地的流量处理（类似逻辑）
+    let server_to_client = async {
+        let mut read_buffer = vec![0u8; 4096];
+        loop {
+            let n: usize = remote_reader.read(&mut read_buffer).await?;
+            if n == 0 {
+                break;
+            }
+            
+            if forward.remote_encryption {
+                remote_buffer.push_data(&read_buffer[..n]);
+                
+                while let Some(decrypted_data) = remote_buffer.try_read_packet(ctx.as_ref().unwrap())? {
+                    let processed_data = if forward.local_encryption {
+                        encrypt_and_prepend_length(&decrypted_data, ctx.as_ref().unwrap()).await?
+                    } else {
+                        decrypted_data
+                    };
+                    
+                    local_writer.write_all(&processed_data).await?;
+                }
+            } else {
+
+                let processed_data = if forward.local_encryption {
+                    encrypt_and_prepend_length(&read_buffer[..n], ctx.as_ref().unwrap()).await?
+                } else {
+                    read_buffer[..n].to_vec()
+                };
+                local_writer.write_all(&processed_data).await?;
+            }
+        }
+        Ok(())
+    };
+    
+    tokio::try_join!(client_to_server, server_to_client)?;
     Ok(())
-    
 }
 
-async  fn listening(listener: TcpListener,name : String,remote_addr: String, mut  stop_receiver:  tokio::sync::broadcast::Receiver<()>)  -> io::Result<()>{
+
+async  fn listening(listener: TcpListener, forward :Forward, mut  stop_receiver:  tokio::sync::broadcast::Receiver<()>)  -> io::Result<()>{
 
     loop {
-        async_info!("Start listening loop for ",name);
+
+        let fw = forward.clone();
+        async_info!("[ ",forward.name," ] Start listening loop for ");
         tokio::select! {
             // normal work
             _ = async {
                 
                 let (socket, addr) = listener.accept().await?;
-
-                async_info!( "[ ",name," ] receive connection from ",addr.ip().to_string());
-        
-                let remote  = remote_addr.clone();
-                
-                tokio::spawn(handle_client(socket, remote));
-
+                async_info!( "[ ",fw.name," ] receive connection from ",addr.ip().to_string());
+                //tokio::spawn(handle_client(socket, remote));
+                tokio::spawn(handle_client_buffered(fw, socket));
                 Ok::<(), std::io::Error>(()) 
                 
             } =>{},
@@ -269,7 +344,7 @@ async  fn listening(listener: TcpListener,name : String,remote_addr: String, mut
             
             // stop signal
             _ = stop_receiver.recv() => {
-                async_info!("Worker received stop signal for ",name);
+                async_info!("[ ",forward.name," ] Worker received stop signal for ");
                 return Ok(())
             }
         }
@@ -277,15 +352,16 @@ async  fn listening(listener: TcpListener,name : String,remote_addr: String, mut
 
 }
 
-async  fn start_listen(config:String,  stop_sender:tokio::sync::broadcast::Sender<()>) ->io::Result<()>{
+pub async  fn start_listen(stop_sender:tokio::sync::broadcast::Sender<()>) ->io::Result<()>{
 
     // read config
-    let mut config_content = File::open(config).await?;
+    let args = Args::parse();
+    async_info!("Start reading confg file");
+    let mut config_content = File::open(args.config).await?;
     let mut content_string = String::from("");
     let _ = config_content.read_to_string(&mut content_string).await?;
-
-
-
+    
+    async_info!("Start extract confg file");
     let result: Result<Config, toml::de::Error> = toml::from_str(&content_string);
     match   result{
         Ok(config)=>
@@ -296,13 +372,15 @@ async  fn start_listen(config:String,  stop_sender:tokio::sync::broadcast::Sende
             let mut set = JoinSet::new();
             for forward in config.forwards {
 
-                async_info!("[",forward.name,"] from ",forward.local_addr," to ",forward.remote_addr);
-        
+                async_info!("[ ",forward.name," ] from ",forward.local_addr," to ",forward.remote_addr," local encryption ",forward.local_encryption," remote encryption ",forward.remote_encryption);
+                
+                let fw = forward.clone();
+
                 let listener: TcpListener = TcpListener::bind(forward.local_addr).await?;
 
                 let  stop_reveiver =  stop_sender.subscribe();
-
-                set.spawn(listening(listener,forward.name,forward.remote_addr, stop_reveiver));
+                
+                set.spawn(listening(listener,fw, stop_reveiver));
                 
             }
             set.join_all().await;
@@ -322,240 +400,3 @@ async  fn start_listen(config:String,  stop_sender:tokio::sync::broadcast::Sende
 
 
 
-// main process for service
-#[cfg(target_os = "windows")]
-fn service_main(_:Vec<OsString>) -> windows_service::Result<()> {
-
-    let (stop_sender,_) = broadcast::channel(1);
-
-    let stop_sender2 = stop_sender.clone();
-
-    let event_handler = move |control_event| -> ServiceControlHandlerResult {
-        match control_event {
-            ServiceControl::Stop | ServiceControl::Interrogate => {
-
-                info!("receve stop signal from windows taskmanager");
-
-                //sender stop signal to receivers
-                let _ = stop_sender2.send(());
-                
-                ServiceControlHandlerResult::NoError
-            }
-            _ => ServiceControlHandlerResult::NotImplemented,
-        }
-    };
-
-    // Register system service event handler
-    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
-
-    let next_status = ServiceStatus {
-        // Should match the one from system service registry
-        service_type: ServiceType::OWN_PROCESS,
-        // The new state
-        current_state: ServiceState::Running,
-        // Accept stop events when running
-        controls_accepted: ServiceControlAccept::STOP,
-        // Used to report an error when starting or stopping only, otherwise must be zero
-        exit_code: ServiceExitCode::Win32(0),
-        // Only used for pending states, otherwise must be zero
-        checkpoint: 0,
-        // Only used for pending states, otherwise must be zero
-        wait_hint: Duration::default(),
-        // Unused for setting status
-        process_id: None,
-    };
-
-    // Tell the system that the service is running now
-    status_handle.set_service_status(next_status)?;
-
-    use tokio::runtime::Runtime;
-    use tklog::error;
-
-    let args = Args::parse();
-
-    // running async fuction as sync
-    let rt = Runtime::new().unwrap();
-    let result = rt.block_on(start_listen(args.config,stop_sender));
-    if let  Err(e) =result  {
-        {
-            error!(e.to_string());
-        }
-    
-    }
-    
-    let next_status2 = ServiceStatus {
-        // Should match the one from system service registry
-        service_type: ServiceType::OWN_PROCESS,
-        // The new state
-        current_state: ServiceState::Stopped,
-        // Accept stop events when running
-        controls_accepted: ServiceControlAccept::STOP,
-        // Used to report an error when starting or stopping only, otherwise must be zero
-        exit_code: ServiceExitCode::Win32(0),
-        // Only used for pending states, otherwise must be zero
-        checkpoint: 0,
-        // Only used for pending states, otherwise must be zero
-        wait_hint: Duration::default(),
-        // Unused for setting status
-        process_id: None,
-    };
-
-    let _ = status_handle.set_service_status(next_status2);
-
-    Ok(())
-}
-
-
-// install as service
-#[cfg(target_os = "windows")]
-pub fn install(config_path: String, log_path: String) -> windows_service::Result<()> {
-    let manager_access = ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE;
-    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
-
-    let service_binary_path = ::std::env::current_exe()
-        .unwrap()
-        .with_file_name("PortForward.exe");
-
-    let mut launch_arguments = Vec::new();
-    
-    launch_arguments.push(OsString::from("--daemon"));
-    launch_arguments.push(OsString::from("service"));
-  
-    launch_arguments.push(OsString::from("--config"));
-    launch_arguments.push(OsString::from(config_path));
-    
-    
-   
-    launch_arguments.push(OsString::from("--log"));
-    launch_arguments.push(OsString::from(log_path));
-    
-
-    let service_info = ServiceInfo {
-        name: OsString::from(SERVICE_NAME),
-        display_name: OsString::from(SERVICE_DISPLAY_NAME),
-        service_type: ServiceType::OWN_PROCESS,
-        start_type: ServiceStartType::AutoStart,
-        error_control: ServiceErrorControl::Normal,
-        executable_path: service_binary_path,
-        launch_arguments,
-        dependencies: vec![],
-        account_name: None,
-        account_password: None,
-    };
-
-    let _service = service_manager.create_service(
-        &service_info,
-        ServiceAccess::CHANGE_CONFIG | ServiceAccess::START,
-    )?;
-
-    info!("Service installed successfully with parameters");
-
-    Ok(())
-}
-
-
-// uninstall from service
-#[cfg(target_os = "windows")]
-pub fn uninstall() -> windows_service::Result<()> {
-    let manager_access = ServiceManagerAccess::CONNECT;
-    let service_manager = ServiceManager::local_computer(None::<&str>, manager_access)?;
-
-    let service_access = ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE;
-    let service = service_manager.open_service(SERVICE_NAME, service_access)?;
-
-    let service_status = service.query_status()?;
-    if service_status.current_state != ServiceState::Stopped {
-        service.stop()?;
-        while let Ok(status) = service.query_status() {
-            if status.current_state == ServiceState::Stopped {
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-    }
-    service.delete()?;
-    info!("Service uninstalled successfully");
-    Ok(())
-}
-
-
-#[cfg(not(target_os = "windows"))]
-
-fn install_linux(config_path: String, log_path: String) -> io::Result<()>{
-
-
-    // Get current executable path
-    let service_binary_path = ::std::env::current_exe()
-        .unwrap()
-        .with_file_name("PortForward");
-
-    // Create service file content
-    let service_content = format!(
-        "[Unit]
-Description={}
-After=network.target
-
-[Service]
-Type=simple
-ExecStart={} --config {} --log {}
-Restart=always
-RestartSec=5s
-
-[Install]
-WantedBy=multi-user.target
-",SERVICE_DISPLAY_NAME,service_binary_path.to_str().unwrap(),config_path, log_path
-    );
-
-    // Define service file path
-    let service_file_path = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
-
-    // Write service file
-    use std::io::Write;
-    let mut file = std::fs::File::create(&service_file_path)?;
-    file.write_all(service_content.as_bytes())?;
-
-    // Reload systemd
-    Command::new("systemctl")
-        .args(["daemon-reload"])
-        .status()?;
-
-    // Enable the service
-    Command::new("systemctl")
-        .args(["enable", SERVICE_NAME])
-        .status()?;
-
-    info!("Successfully installed service . You can start it with: systemctl start ", SERVICE_NAME);
-
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-
-
-fn uninstall_linux() -> io::Result<()> {
-
-    // Stop the service if running
-    let _ = Command::new("systemctl")
-        .args(["stop", SERVICE_NAME])
-        .status()?;
-
-    // Disable the service
-    Command::new("systemctl")
-        .args(["disable", SERVICE_NAME])
-        .status()?;
-
-    // Remove service file
-    let service_file_path = format!("/etc/systemd/system/{}.service", SERVICE_NAME);
-    if Path::new(&service_file_path).exists() {
-        std::fs::remove_file(&service_file_path)?;
-    }
-
-    // Reload systemd
-    Command::new("systemctl")
-        .args(["daemon-reload"])
-        .status()?;
-
-    info!("Successfully uninstalled service ",SERVICE_NAME);
-
-    Ok(())
-}
